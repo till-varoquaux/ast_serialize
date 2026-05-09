@@ -3066,6 +3066,10 @@ fn serialize_type(ser: &mut Serializer, t: &ast::Expr) {
             if matches!(e.op, ast::Operator::BitOr) {
                 serialize_union_type(ser, e, t.range(), None, None);
                 return;
+            } else if matches!(e.op, ast::Operator::MatMult) {
+                // Handle Annotated types (x @ y)
+                serialize_annotated_type(ser, e, t.range());
+                return;
             } else {
                 // Other binary operators are not valid in type annotations
                 // Serialize as invalid type
@@ -3380,6 +3384,109 @@ fn serialize_union_type(
     ser.write_bool(ser.is_evaluated);
     ser.write_location(range);
     ser.write_end_tag();
+}
+
+fn is_annotated_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"Annotated"
+            | b"typing.Annotated"
+            | b"typing_extensions.Annotated"
+            | b"types.AnnotatedType"
+    )
+}
+
+fn ends_with_annotated(name: &[u8]) -> bool {
+    name.ends_with(b"Annotated") || name.ends_with(b"AnnotatedType")
+}
+
+fn get_annotated_node_name(expr: &ast::Expr) -> Option<Vec<u8>> {
+    match expr {
+        ast::Expr::BinOp(binop) if matches!(binop.op, ast::Operator::MatMult) => {
+            get_annotated_node_name(&binop.left)
+        }
+        ast::Expr::Subscript(sub) => {
+            let mut v = Vec::new();
+            if get_qualified_type_name(&mut v, &sub.value) && is_annotated_name(&v) {
+                Some(v)
+            } else {
+                None
+            }
+        }
+        _ => {
+            let mut v = Vec::new();
+            if get_qualified_type_name(&mut v, expr) && ends_with_annotated(&v) {
+                Some(v)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Serialize an annotated type shorthand (x @ y) as an UnboundType with name "Annotated".
+fn serialize_annotated_type(ser: &mut Serializer, binop: &ast::ExprBinOp, range: TextRange) {
+    let mut args = Vec::new();
+    collect_annotated_args(&binop.left, &mut args);
+    args.push(&binop.right);
+
+    // Determine the node name, preserving qualified paths if present on the left
+    let mut node_name = b"@Annotated".to_vec();
+    if let Some(name) = get_annotated_node_name(&binop.left) {
+        node_name = name;
+    }
+
+    ser.write_tag(TAG_UNBOUND_TYPE);
+    ser.write_bytes(&node_name);
+    ser.write_tag(TAG_LIST_GEN);
+    ser.write_int(args.len() as i64);
+
+    // First argument is a type
+    serialize_type(ser, args[0]);
+
+    // Remaining arguments are metadata
+    for arg in &args[1..] {
+        serialize_type(ser, arg);
+    }
+
+    // Write empty_tuple_index
+    ser.write_bool(false);
+    // Write None for original_str_expr (optional field)
+    ser.write_tag(TAG_LITERAL_NONE);
+    // Write None for original_str_fallback (optional field)
+    ser.write_tag(TAG_LITERAL_NONE);
+    ser.write_location(range);
+    ser.write_end_tag();
+}
+
+/// Collect all arguments from a nested sequence of '@' operations.
+fn collect_annotated_args<'a>(expr: &'a ast::Expr, args: &mut Vec<&'a ast::Expr>) {
+    match expr {
+        ast::Expr::BinOp(binop) if matches!(binop.op, ast::Operator::MatMult) => {
+            collect_annotated_args(&binop.left, args);
+            args.push(&binop.right);
+        }
+        ast::Expr::Subscript(sub) => {
+            let mut v = Vec::new();
+            if get_qualified_type_name(&mut v, &sub.value) && is_annotated_name(&v) {
+                match sub.slice.as_ref() {
+                    ast::Expr::Tuple(t) => {
+                        for elt in &t.elts {
+                            args.push(elt);
+                        }
+                    }
+                    _ => {
+                        args.push(&sub.slice);
+                    }
+                }
+            } else {
+                args.push(expr);
+            }
+        }
+        _ => {
+            args.push(expr);
+        }
+    }
 }
 
 /// Serialize an Attribute type (e.g., foo.bar.Baz) with optional original_str_expr.
